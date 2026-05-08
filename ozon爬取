@@ -1,0 +1,191 @@
+# -*- coding: utf-8 -*-
+import os
+import random
+import time
+import json
+import pandas as pd
+import requests
+from fake_useragent import UserAgent
+from typing import List, Dict, Optional
+
+# ===================== 配置区 =====================
+# 代理配置（推荐使用环境变量，例如：export OZON_PROXY="http://user:pass@ip:port"）
+PROXY = os.getenv("OZON_PROXY")          # 如果不设置，则不使用代理
+# Ozon 中国馆类目 ID（固定）
+CATEGORY_ID = "170035"
+# 爬取页数（建议 1~5 页，每页 50 条）
+PAGE_COUNT = 2
+# 请求间隔（随机 3~7 秒，避免封 IP）
+MIN_DELAY = 3
+MAX_DELAY = 7
+# 最大重试次数
+MAX_RETRIES = 3
+# =================================================
+
+# 动态 User-Agent
+ua = UserAgent()
+
+# 构造会话（自动管理 cookies）
+session = requests.Session()
+session.headers.update({
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+})
+
+if PROXY:
+    session.proxies = {"http": PROXY, "https": PROXY}
+    print(f"[信息] 已配置代理: {PROXY.split('@')[-1] if '@' in PROXY else PROXY}")
+
+def get_headers() -> dict:
+    """生成随机请求头（每次请求可不同）"""
+    return {
+        "User-Agent": ua.random,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.ozon.ru/category/kitayskie-tovary/",
+        "Origin": "https://www.ozon.ru",
+    }
+
+def fetch_page(page: int) -> Optional[List[Dict]]:
+    """获取单页商品数据（带重试）"""
+    url = "https://www.ozon.ru/api/composer-api.bx/page/json/v2"
+    params = {
+        "url": f"/category/kitayskie-tovary-{CATEGORY_ID}/?sorting=popular&page={page}"
+    }
+    
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # 随机延时
+            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+            resp = session.get(
+                url,
+                params=params,
+                headers=get_headers(),
+                timeout=20
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return extract_products(data)
+            elif resp.status_code == 403:
+                print(f"[错误] 第{page}页返回403，可能需要更换代理或添加Cookie。")
+                return None
+            else:
+                print(f"[警告] 第{page}页状态码 {resp.status_code}，重试 {attempt}/{MAX_RETRIES}")
+        except Exception as e:
+            print(f"[异常] 第{page}页请求失败: {e}，重试 {attempt}/{MAX_RETRIES}")
+            time.sleep(5)
+    print(f"[失败] 第{page}页最终请求失败")
+    return None
+
+def extract_products(data: dict) -> List[Dict]:
+    """
+    从 Ozon API 返回数据中提取商品列表
+    兼容两种常见结构：
+      1. widgetStates 中包含 "searchResultsV2" 的键
+      2. 直接以 list 形式存在于某个 widget 中
+    """
+    products = []
+    widget_states = data.get("widgetStates", {})
+    
+    # 方式1：查找包含 "searchResults" 的 widget
+    for key, value_str in widget_states.items():
+        if "searchResults" in key.lower():
+            try:
+                widget_data = json.loads(value_str)
+                items = widget_data.get("items", [])
+                if items:
+                    for item in items:
+                        prod = parse_single_product(item)
+                        if prod:
+                            products.append(prod)
+                    return products  # 找到第一个有效 widget 即返回
+            except json.JSONDecodeError:
+                continue
+    
+    # 方式2：部分页面结构不同，尝试直接查找 "layout"
+    layout = data.get("layout", [])
+    for block in layout:
+        if block.get("type") == "searchResults":
+            items = block.get("items", []) or block.get("data", {}).get("items", [])
+            for item in items:
+                prod = parse_single_product(item)
+                if prod:
+                    products.append(prod)
+    return products
+
+def parse_single_product(item: dict) -> Optional[Dict]:
+    """解析单个商品字段（兼容不同字段名）"""
+    try:
+        # 商品ID
+        product_id = item.get("id") or item.get("offerId") or item.get("sku")
+        if not product_id:
+            return None
+        
+        # 商品标题
+        title = item.get("title") or item.get("name") or ""
+        # 价格（单位：卢布）
+        price_info = item.get("price", {})
+        price = price_info.get("price") if price_info else item.get("priceText")
+        if isinstance(price, str):
+            price = price.replace("₽", "").replace("\xa0", "").strip()
+        # 销量
+        orders = item.get("ordersCount") or item.get("soldCount") or item.get("quantity")
+        if orders is None:
+            # 有时销量隐藏在 action 字段
+            action = item.get("action", {})
+            orders = action.get("ordersCount")
+        # 图片
+        images = item.get("images", [])
+        image_url = images[0].get("src") if images else ""
+        # 链接
+        link = item.get("link") or item.get("href", "")
+        if link and not link.startswith("http"):
+            link = "https://www.ozon.ru" + link
+        
+        return {
+            "商品ID": str(product_id),
+            "商品名称": title,
+            "价格(卢布)": price,
+            "销量": orders if orders else 0,
+            "商品链接": link,
+            "图片链接": image_url,
+        }
+    except Exception as e:
+        print(f"[解析错误] {e}")
+        return None
+
+def save_to_excel(data: List[Dict], filename="ozon_hot_products.xlsx"):
+    """保存为 Excel，并去重（按商品ID）"""
+    if not data:
+        print("无数据，未保存文件")
+        return
+    df = pd.DataFrame(data)
+    # 去重
+    df.drop_duplicates(subset=["商品ID"], keep="first", inplace=True)
+    df.to_excel(filename, index=False, engine="openpyxl")
+    print(f"已保存 {len(df)} 条商品数据到 {filename}")
+
+def main():
+    print("===== 开始爬取 Ozon 中国馆热销商品 =====")
+    all_products = []
+    
+    for page in range(1, PAGE_COUNT + 1):
+        print(f"正在抓取第 {page} 页 ...")
+        page_products = fetch_page(page)
+        if page_products:
+            all_products.extend(page_products)
+            print(f"第 {page} 页获取到 {len(page_products)} 条商品，累计 {len(all_products)} 条")
+        else:
+            print(f"第 {page} 页无数据，停止后续抓取")
+            break
+    
+    save_to_excel(all_products)
+    print("===== 爬取结束 =====")
+
+if __name__ == "__main__":
+    main()
