@@ -189,3 +189,291 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+第二版本：
+# -*- coding: utf-8 -*-
+"""
+Ozon 中国馆热销商品爬虫（最终稳定版）
+- 支持 Cloudflare 绕过（cloudscraper）
+- 自动预热会话，获取必要 Cookie 和 CSRF Token
+- 智能解析商品列表（jsonpath 模糊匹配，不依赖固定键名）
+- 支持代理池轮换（推荐使用俄罗斯住宅代理）
+- 完善的错误处理和空数据调试
+"""
+
+import os
+import random
+import time
+import json
+import pandas as pd
+import cloudscraper
+from fake_useragent import UserAgent
+from typing import List, Dict, Optional
+from jsonpath_ng import parse
+
+# ===================== 配置区 =====================
+# 代理配置：可设置单个代理或代理列表（逗号分隔）
+# 示例：export OZON_PROXIES="http://user:pass@ip1:port,http://user:pass@ip2:port"
+PROXY_LIST = os.getenv("OZON_PROXIES", "").split(",")
+# 如果没有代理，强烈建议配置，否则国内直连几乎必 403
+if PROXY_LIST == [""]:
+    PROXY_LIST = []
+
+CATEGORY_ID = "170035"          # 中国馆类目ID
+PAGE_COUNT = 3                  # 爬取页数（建议1~5页）
+MIN_DELAY = 3                   # 随机延时下限（秒）
+MAX_DELAY = 7                   # 随机延时上限
+MAX_RETRIES = 3                 # 每页最大重试次数
+# =================================================
+
+# 初始化抓取器（绕过 Cloudflare）
+scraper = cloudscraper.create_scraper(browser="chrome")
+ua = UserAgent()
+
+# 基础请求头
+scraper.headers.update({
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+})
+
+def get_random_ua() -> str:
+    return ua.random
+
+def get_random_proxy() -> Optional[str]:
+    """随机选择一个代理，如果没有则返回 None"""
+    if PROXY_LIST:
+        return random.choice(PROXY_LIST)
+    return None
+
+def warmup_session() -> bool:
+    """
+    预热会话：访问首页获取必要的 Cookie 和 CSRF Token
+    这一步对绕过 Ozon 的行为检测很重要
+    """
+    print("[预热] 正在访问 Ozon 首页以建立会话...")
+    warm_url = "https://www.ozon.ru"
+    try:
+        resp = scraper.get(
+            warm_url,
+            headers={"User-Agent": get_random_ua()},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            # 尝试提取 CSRF Token（常见名称：x-csrf-token、csrf-token）
+            csrf_token = (
+                scraper.cookies.get("x-csrf-token") or
+                scraper.cookies.get("csrf-token") or
+                scraper.cookies.get("_csrf")
+            )
+            if csrf_token:
+                scraper.headers.update({"x-csrf-token": csrf_token})
+                print("[预热] 已获取 CSRF Token")
+            print("[预热] 会话建立成功")
+            return True
+        else:
+            print(f"[预热] 失败，状态码 {resp.status_code}")
+            return False
+    except Exception as e:
+        print(f"[预热] 异常: {e}")
+        return False
+
+def fetch_page(page: int) -> Optional[List[Dict]]:
+    """
+    抓取单页商品数据
+    - 自动使用代理轮换
+    - 随机 User-Agent 和延时
+    - 重试机制
+    """
+    url = "https://www.ozon.ru/api/composer-api.bx/page/json/v2"
+    params = {
+        "url": f"/category/kitayskie-tovary-{CATEGORY_ID}/?sorting=popular&page={page}"
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        proxy = get_random_proxy()
+        if proxy:
+            scraper.proxies = {"http": proxy, "https": proxy}
+            print(f"  尝试用代理: {proxy.split('@')[-1] if '@' in proxy else proxy}")
+        else:
+            scraper.proxies = {}
+            print("  警告：未使用代理，大概率被拦截")
+
+        try:
+            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+            resp = scraper.get(
+                url,
+                params=params,
+                headers={"User-Agent": get_random_ua()},
+                timeout=20
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                products = extract_products_flex(data)
+                # 如果解析结果为空，可能是结构变化，保存原始数据用于调试
+                if not products:
+                    with open(f"debug_page_{page}.json", "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    print(f"  [调试] 第{page}页返回200但无商品，已保存原始响应至 debug_page_{page}.json")
+                return products if products else None
+            elif resp.status_code in (403, 429):
+                print(f"  [拦截] 第{page}页 {resp.status_code}，IP可能被限制，尝试换代理")
+                # 如果当前有代理，移除它再重试（强制使用另一个代理）
+                if PROXY_LIST:
+                    # 简单地从列表中移除当前失败的代理（下次随机会避开）
+                    if proxy in PROXY_LIST:
+                        PROXY_LIST.remove(proxy)
+                        print(f"  已从代理池移除无效代理: {proxy}")
+                continue
+            else:
+                print(f"  [重试] 第{page}页 状态码 {resp.status_code}，尝试 {attempt}/{MAX_RETRIES}")
+        except Exception as e:
+            print(f"  [异常] {str(e)[:80]}，重试 {attempt}/{MAX_RETRIES}")
+        time.sleep(5)
+    print(f"  [失败] 第{page}页 所有重试均无效")
+    return None
+
+def extract_products_flex(data: dict) -> List[Dict]:
+    """
+    使用 jsonpath 灵活提取所有 items 数组，不依赖特定键名
+    兼容 Ozon 各种改版布局
+    """
+    products = []
+    # jsonpath 表达式：查找任何层级的 "items" 字段，取其每个元素
+    expr = parse("$..items[*]")
+    matches = expr.find(data)
+    for match in matches:
+        item = match.value
+        if not isinstance(item, dict):
+            continue
+        prod = parse_single_product(item)
+        if prod:
+            products.append(prod)
+    return products
+
+def parse_single_product(item: dict) -> Optional[Dict]:
+    """解析单个商品字段（多路径容错）"""
+    try:
+        # 商品ID
+        product_id = item.get("id") or item.get("offerId") or item.get("sku")
+        if not product_id:
+            return None
+
+        title = item.get("title", "").strip()
+        if not title:
+            title = item.get("name", "").strip()
+
+        # 价格
+        price_info = item.get("price", {})
+        if isinstance(price_info, dict):
+            price = price_info.get("price", "")
+        else:
+            price = item.get("priceText", "")
+        if isinstance(price, str):
+            price = price.replace("₽", "").replace("\xa0", "").replace(" ", "").strip()
+        else:
+            price = str(price)
+
+        # 销量（多层尝试）
+        orders = item.get("ordersCount") or item.get("soldCount") or item.get("quantity", 0)
+        if not orders:
+            actions = item.get("action", {})
+            if isinstance(actions, dict):
+                orders = actions.get("ordersCount", 0)
+        if not orders:
+            card = item.get("cardInfo", {})
+            if isinstance(card, dict):
+                orders = card.get("ordersCount", 0)
+
+        # 图片
+        images = item.get("images", [])
+        image_url = images[0].get("src", "") if images else ""
+
+        # 链接
+        link = item.get("link") or item.get("href", "")
+        if link and not link.startswith("http"):
+            link = "https://www.ozon.ru" + link
+
+        return {
+            "商品ID": str(product_id),
+            "商品名称": title,
+            "价格(卢布)": price,
+            "销量": orders if isinstance(orders, int) else 0,
+            "商品链接": link,
+            "图片链接": image_url,
+        }
+    except Exception:
+        return None
+
+def save_to_excel(data: List[Dict], filename="ozon_hot_products.xlsx"):
+    """去重并保存Excel"""
+    if not data:
+        print("没有获取到商品数据，未生成文件。")
+        return
+    df = pd.DataFrame(data)
+    df.drop_duplicates(subset=["商品ID"], keep="first", inplace=True)
+    df.to_excel(filename, index=False, engine="openpyxl")
+    print(f"\n✅ 成功保存 {len(df)} 条商品到文件：{filename}")
+
+def main():
+    print("===== Ozon 中国馆热销爬虫（最终稳定版）=====")
+    if not PROXY_LIST:
+        print("⚠️ 强烈警告：未配置任何代理！国内IP直连大概率返回403或无数据。")
+        print("建议设置环境变量 OZON_PROXIES，例如：")
+        print("  export OZON_PROXIES=\"http://user:pass@ip:port\"")
+        print("  或购买俄罗斯住宅代理后配置。")
+        proceed = input("是否仍要继续？(y/N): ")
+        if proceed.lower() != 'y':
+            return
+
+    # 预热会话
+    if not warmup_session():
+        print("会话预热失败，继续尝试抓取（成功率较低）...")
+
+    all_products = []
+    for page in range(1, PAGE_COUNT + 1):
+        print(f"\n[分页] 正在抓取第 {page} 页 ...")
+        page_products = fetch_page(page)
+        if page_products:
+            all_products.extend(page_products)
+            print(f"  第 {page} 页获得 {len(page_products)} 件商品 | 累计 {len(all_products)} 件")
+        else:
+            print(f"  第 {page} 页无效，停止后续翻页。")
+            break
+
+    save_to_excel(all_products)
+    print("\n===== 爬取结束 =====")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
